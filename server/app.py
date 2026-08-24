@@ -161,6 +161,24 @@ async def is_logged_in(page):
     return ("hi, mr" in text or "hi, ms" in text or "my portfolio" in text) and "enter your phone number" not in text
 
 
+async def wait_past_shield_check(page, max_wait_ms=20000, poll_ms=1000):
+    """bigmint.co sits behind a Bunny Shield JS challenge ("Establishing a
+    secure connection...") that briefly interstitials real navigations too.
+    Poll until the title moves past it instead of assuming one fixed delay
+    is enough."""
+    waited = 0
+    while waited < max_wait_ms:
+        try:
+            title = (await page.title()).lower()
+        except Exception:
+            title = ""
+        if "establishing" not in title and "secure connection" not in title:
+            break
+        await page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+    await page.wait_for_timeout(1500)
+
+
 def find_header_column(ws, header_row, predicate, max_col=60):
     for col in range(1, max_col + 1):
         val = ws.cell(row=header_row, column=col).value
@@ -385,14 +403,27 @@ async def run_scrape(request: Request):
 
     results = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1440, "height": 900})
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
         await context.add_cookies(cookies)
         page = await context.new_page()
 
         try:
             await page.goto(BIGMINT_HOME, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2500)
+            await wait_past_shield_check(page)
         except Exception as e:
             await browser.close()
             return JSONResponse({"status": "error", "message": f"Could not reach bigmint.co: {e}"}, status_code=502)
@@ -405,15 +436,24 @@ async def run_scrape(request: Request):
             except Exception:
                 debug_url, debug_title, debug_snippet = "", "", ""
             await browser.close()
-            if used_saved_cookies and COOKIES_FILE.exists():
-                COOKIES_FILE.unlink()
-            message = (
-                "Saved cookies have expired. Export fresh cookies from a logged-in BigMint browser "
-                "session and paste them in — they'll be reused automatically next time."
-                if used_saved_cookies else
-                "These cookies didn't log in — they've likely expired. Export fresh cookies from a "
-                "logged-in BigMint browser session and paste them in again."
-            )
+
+            blocked_by_shield = "establishing" in debug_title.lower() or "secure connection" in debug_title.lower()
+            if blocked_by_shield:
+                message = (
+                    "bigmint.co's bot-protection page didn't clear in time — this isn't your cookies, "
+                    "the automated browser got stuck on their security check. Try running again in a "
+                    "minute; if it keeps happening, tell me and I'll dig further."
+                )
+            else:
+                if used_saved_cookies and COOKIES_FILE.exists():
+                    COOKIES_FILE.unlink()
+                message = (
+                    "Saved cookies have expired. Export fresh cookies from a logged-in BigMint browser "
+                    "session and paste them in — they'll be reused automatically next time."
+                    if used_saved_cookies else
+                    "These cookies didn't log in — they've likely expired. Export fresh cookies from a "
+                    "logged-in BigMint browser session and paste them in again."
+                )
             return JSONResponse({
                 "status": "cookies_expired",
                 "message": message,
