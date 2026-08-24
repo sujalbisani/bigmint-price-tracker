@@ -114,7 +114,7 @@
 <body>
 <div class="wrap">
   <h1>BigMint Price Tracker</h1>
-  <div class="sub">Paste fresh bigmint.co cookies, hit Run — it scrapes today's prices, updates the tracker, and generates a snapshot.</div>
+  <div class="sub" id="subline">Paste fresh bigmint.co cookies, hit Run — it scrapes today's prices, updates the tracker, and generates a snapshot.</div>
 
   <div class="panel">
     <div class="field" id="passwordField" style="display:none;">
@@ -123,12 +123,12 @@
     </div>
 
     <div class="field">
-      <label for="cookies">bigmint.co cookies (JSON export)</label>
+      <label for="cookies">bigmint.co cookies (JSON export) <span id="cookiesOptionalTag" style="font-weight:400; color:var(--muted); display:none;">— optional, saved cookies will be reused</span></label>
       <textarea id="cookies" placeholder='Paste the exported cookies JSON here, e.g. [{"domain":".bigmint.co","name":"laravel_session",...}, ...]'></textarea>
-      <div class="hint">
+      <div class="hint" id="cookiesHint">
         Export cookies for bigmint.co while logged in (a browser extension like "Cookie-Editor" works),
-        then paste the JSON here. Nothing is stored on this server between runs except in memory for the
-        duration of the scrape.
+        then paste the JSON here. The server saves the last working cookies on disk and reuses them on
+        future runs, so you only need to paste again once they expire.
       </div>
     </div>
 
@@ -153,6 +153,11 @@
     const cfg = await resp.json();
     if (cfg.password_required) {
       document.getElementById('passwordField').style.display = 'block';
+    }
+    if (cfg.cookies_saved) {
+      document.getElementById('cookiesOptionalTag').style.display = 'inline';
+      document.getElementById('subline').textContent =
+        'Saved cookies are available — hit Run to scrape today\'s prices, or paste fresh cookies below to replace them.';
     }
   } catch (e) {
     // Config check failing shouldn't block the page — just leave password field hidden.
@@ -186,6 +191,7 @@ async function runScrape() {
       statusEl.className = 'status show err';
       statusEl.textContent = '✖ ' + data.message;
     } else if (data.status === 'ok') {
+      document.getElementById('cookiesOptionalTag').style.display = 'inline';
       statusEl.className = 'status show ok';
       statusEl.textContent = `✔ Done for ${data.date} — ${data.scraped_ok}/${data.scraped} prices captured, ` +
         `${data.tracker.updated} tracker rows updated` +

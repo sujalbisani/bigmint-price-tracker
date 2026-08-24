@@ -5,3 +5,4 @@ server/data/backups/
 server/data/snapshots/
 server/data/latest_output.csv
 server/data/bigmint_prices_output_*.csv
+server/data/session_cookies.json

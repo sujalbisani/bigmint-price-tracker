@@ -36,6 +36,7 @@ TRACKER_FILE = DATA_DIR / "tracker.xlsx"
 BACKUP_DIR = DATA_DIR / "backups"
 SNAPSHOT_DIR = DATA_DIR / "snapshots"
 OUTPUT_CSV = DATA_DIR / "latest_output.csv"
+COOKIES_FILE = DATA_DIR / "session_cookies.json"
 
 EXCEL_SHEET = "Monthly"
 EXCEL_URL_HEADER = "url"
@@ -111,6 +112,19 @@ def normalize_cookies(raw):
         except Exception:
             continue
     return out
+
+
+def load_saved_cookies():
+    if not COOKIES_FILE.exists():
+        return None
+    try:
+        return json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_cookies(cookies):
+    COOKIES_FILE.write_text(json.dumps(cookies), encoding="utf-8")
 
 
 def read_urls():
@@ -328,7 +342,7 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"password_required": bool(APP_PASSWORD)}
+    return {"password_required": bool(APP_PASSWORD), "cookies_saved": COOKIES_FILE.exists()}
 
 
 @app.post("/api/run")
@@ -339,21 +353,29 @@ async def run_scrape(request: Request):
         return JSONResponse({"status": "error", "message": "Incorrect password."}, status_code=401)
 
     cookies_text = (payload.get("cookies_text") or "").strip()
-    if not cookies_text:
-        return JSONResponse({"status": "error", "message": "Paste your bigmint.co cookies JSON first."}, status_code=400)
+    used_saved_cookies = False
 
-    try:
-        raw = json.loads(cookies_text)
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": f"That doesn't look like valid JSON: {e}"}, status_code=400)
+    if cookies_text:
+        try:
+            raw = json.loads(cookies_text)
+        except Exception as e:
+            return JSONResponse({"status": "error", "message": f"That doesn't look like valid JSON: {e}"}, status_code=400)
 
-    try:
-        cookies = normalize_cookies(raw)
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+        try:
+            cookies = normalize_cookies(raw)
+        except Exception as e:
+            return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
 
-    if not cookies:
-        return JSONResponse({"status": "error", "message": "No bigmint.co cookies found in that JSON."}, status_code=400)
+        if not cookies:
+            return JSONResponse({"status": "error", "message": "No bigmint.co cookies found in that JSON."}, status_code=400)
+    else:
+        cookies = load_saved_cookies()
+        if not cookies:
+            return JSONResponse({
+                "status": "error",
+                "message": "No saved cookies yet — paste your bigmint.co cookies JSON once to get started.",
+            }, status_code=400)
+        used_saved_cookies = True
 
     if not URLS_FILE.exists():
         return JSONResponse({"status": "error", "message": "Server has no urls.csv configured — see README."}, status_code=500)
@@ -377,10 +399,18 @@ async def run_scrape(request: Request):
 
         if not await is_logged_in(page):
             await browser.close()
-            return JSONResponse({
-                "status": "cookies_expired",
-                "message": "These cookies didn't log in — they've likely expired. Export fresh cookies from a logged-in BigMint browser session and paste them in again.",
-            }, status_code=200)
+            if used_saved_cookies and COOKIES_FILE.exists():
+                COOKIES_FILE.unlink()
+            message = (
+                "Saved cookies have expired. Export fresh cookies from a logged-in BigMint browser "
+                "session and paste them in — they'll be reused automatically next time."
+                if used_saved_cookies else
+                "These cookies didn't log in — they've likely expired. Export fresh cookies from a "
+                "logged-in BigMint browser session and paste them in again."
+            )
+            return JSONResponse({"status": "cookies_expired", "message": message}, status_code=200)
+
+        save_cookies(cookies)
 
         for url in urls:
             row = {"url": url, "current_price": "", "status": "ok", "notes": ""}

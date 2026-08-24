@@ -72,6 +72,12 @@ you run once a day, that's a fine tradeoff for $0.
 
 ## Getting fresh cookies
 
+You don't need to paste cookies every day. The server saves the last cookies
+that successfully logged in (`server/data/session_cookies.json`, gitignored)
+and reuses them automatically on the next run if you leave the textbox
+blank. You'll only be asked to paste again when those saved cookies actually
+expire.
+
 When the app tells you cookies have expired:
 
 1. Log into bigmint.co in your regular browser.
@@ -79,7 +85,8 @@ When the app tells you cookies have expired:
 3. Paste that JSON into the textbox on the web app and click Run.
 
 The app only accepts `.bigmint.co` cookies — anything else in the export is
-ignored.
+ignored. Note that on Render's free tier, saved cookies (like the tracker
+data) don't survive a redeploy — see the storage note below.
 
 ## Important limitation: storage isn't guaranteed permanent
 
