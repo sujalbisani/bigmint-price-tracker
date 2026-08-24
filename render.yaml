@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: bigmint-price-tracker
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    plan: free
+    envVars:
+      - key: APP_PASSWORD
+        sync: false

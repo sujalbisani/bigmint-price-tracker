@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+server/data/backups/
+server/data/snapshots/
+server/data/latest_output.csv
+server/data/bigmint_prices_output_*.csv
