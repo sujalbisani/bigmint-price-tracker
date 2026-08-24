@@ -170,6 +170,30 @@ async def is_logged_in(page):
     return ("hi, mr" in text or "hi, ms" in text or "my portfolio" in text) and "enter your phone number" not in text
 
 
+TRACKER_HOSTS = (
+    "posthog.com", "i.posthog.com",
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "facebook.net", "connect.facebook.net",
+    "clarity.ms", "adroll.com", "sendinblue.com", "sibautomation.com",
+    "hotjar.com",
+)
+
+
+async def _block_heavy_requests(route):
+    """Drop images/media/fonts and known analytics/tracker requests so
+    Chromium's memory footprint stays low enough to survive Render's
+    free-tier RAM limit — we only need the page's text content, not its
+    images or third-party trackers."""
+    req = route.request
+    if req.resource_type in ("image", "media", "font"):
+        await route.abort()
+        return
+    if any(host in req.url for host in TRACKER_HOSTS):
+        await route.abort()
+        return
+    await route.continue_()
+
+
 async def wait_past_shield_check(page, max_wait_ms=20000, poll_ms=1000):
     """bigmint.co sits behind a Bunny Shield JS challenge ("Establishing a
     secure connection...") that briefly interstitials real navigations too.
@@ -446,15 +470,17 @@ async def _do_scrape(cookies, used_saved_cookies):
                 "--disable-blink-features=AutomationControlled",
                 # Render's free tier has very little RAM; these cut Chromium's
                 # footprint to reduce the odds of an OOM kill mid-run.
+                # (Deliberately NOT --single-process — that flag is known to
+                # be unstable for headless Chrome on Linux and can itself
+                # cause the crashes it's meant to prevent.)
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-sandbox",
                 "--disable-extensions",
-                "--single-process",
             ],
         )
         context = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
+            viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -464,6 +490,7 @@ async def _do_scrape(cookies, used_saved_cookies):
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
+        await context.route("**/*", _block_heavy_requests)
         await context.add_cookies(cookies)
         page = await context.new_page()
 
