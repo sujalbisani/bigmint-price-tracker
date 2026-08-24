@@ -398,6 +398,12 @@ async def run_scrape(request: Request):
             return JSONResponse({"status": "error", "message": f"Could not reach bigmint.co: {e}"}, status_code=502)
 
         if not await is_logged_in(page):
+            try:
+                debug_url = page.url
+                debug_title = await page.title()
+                debug_snippet = (await page.locator("body").inner_text(timeout=3000))[:300]
+            except Exception:
+                debug_url, debug_title, debug_snippet = "", "", ""
             await browser.close()
             if used_saved_cookies and COOKIES_FILE.exists():
                 COOKIES_FILE.unlink()
@@ -408,7 +414,16 @@ async def run_scrape(request: Request):
                 "These cookies didn't log in — they've likely expired. Export fresh cookies from a "
                 "logged-in BigMint browser session and paste them in again."
             )
-            return JSONResponse({"status": "cookies_expired", "message": message}, status_code=200)
+            return JSONResponse({
+                "status": "cookies_expired",
+                "message": message,
+                "debug": {
+                    "cookie_names_sent": sorted(set(c["name"] for c in cookies)),
+                    "landed_url": debug_url,
+                    "page_title": debug_title,
+                    "body_snippet": debug_snippet,
+                },
+            }, status_code=200)
 
         save_cookies(cookies)
 

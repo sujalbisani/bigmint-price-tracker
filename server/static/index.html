@@ -187,6 +187,17 @@ async function runScrape() {
     if (data.status === 'cookies_expired') {
       statusEl.className = 'status show warn';
       statusEl.textContent = '⚠️ ' + data.message;
+      if (data.debug) {
+        const d = data.debug;
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'white-space:pre-wrap; margin-top:10px; font-size:0.75rem; opacity:0.85;';
+        pre.textContent =
+          `Cookie names sent: ${(d.cookie_names_sent || []).join(', ') || '(none)'}\n` +
+          `Landed on: ${d.landed_url}\n` +
+          `Page title: ${d.page_title}\n` +
+          `Body snippet: ${d.body_snippet}`;
+        statusEl.appendChild(pre);
+      }
     } else if (data.status === 'error') {
       statusEl.className = 'status show err';
       statusEl.textContent = '✖ ' + data.message;
