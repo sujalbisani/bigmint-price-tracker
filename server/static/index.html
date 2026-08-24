@@ -164,6 +164,13 @@
   }
 })();
 
+function appendDebug(statusEl, lines) {
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'white-space:pre-wrap; margin-top:10px; font-size:0.75rem; opacity:0.85;';
+  pre.textContent = lines;
+  statusEl.appendChild(pre);
+}
+
 async function runScrape() {
   const btn = document.getElementById('runBtn');
   const statusEl = document.getElementById('status');
@@ -173,7 +180,7 @@ async function runScrape() {
 
   resultsWrap.style.display = 'none';
   statusEl.className = 'status show pending';
-  statusEl.textContent = 'Running — logging in and scraping prices, this can take 30–60s (longer if the server was asleep)…';
+  statusEl.textContent = 'Starting…';
   btn.disabled = true;
 
   try {
@@ -182,58 +189,113 @@ async function runScrape() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cookies_text: cookiesText, password: password }),
     });
-    const data = await resp.json();
-
-    if (data.status === 'cookies_expired') {
-      statusEl.className = 'status show warn';
-      statusEl.textContent = '⚠️ ' + data.message;
-      if (data.debug) {
-        const d = data.debug;
-        const pre = document.createElement('pre');
-        pre.style.cssText = 'white-space:pre-wrap; margin-top:10px; font-size:0.75rem; opacity:0.85;';
-        pre.textContent =
-          `Cookie names sent: ${(d.cookie_names_sent || []).join(', ') || '(none)'}\n` +
-          `Landed on: ${d.landed_url}\n` +
-          `Page title: ${d.page_title}\n` +
-          `Body snippet: ${d.body_snippet}`;
-        statusEl.appendChild(pre);
-      }
-    } else if (data.status === 'error') {
+    let data;
+    const raw = await resp.text();
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
       statusEl.className = 'status show err';
-      statusEl.textContent = '✖ ' + data.message;
-    } else if (data.status === 'ok') {
-      document.getElementById('cookiesOptionalTag').style.display = 'inline';
-      statusEl.className = 'status show ok';
-      statusEl.textContent = `✔ Done for ${data.date} — ${data.scraped_ok}/${data.scraped} prices captured, ` +
-        `${data.tracker.updated} tracker rows updated` +
-        (data.tracker.skipped ? `, ${data.tracker.skipped} skipped` : '') + '.';
-
-      const tbody = document.querySelector('#resultsTable tbody');
-      tbody.innerHTML = '';
-      data.results.forEach(r => {
-        const tr = document.createElement('tr');
-        const item = r.url.split('/').pop();
-        const badgeClass = r.status === 'ok' ? 'ok' : (r.status === 'check' ? 'check' : 'error');
-        tr.innerHTML = `<td>${item}</td><td>${r.current_price || '—'}</td><td><span class="badge ${badgeClass}">${r.status}</span></td>`;
-        tbody.appendChild(tr);
-      });
-
-      const dl = document.getElementById('downloads');
-      dl.innerHTML = `
-        <a href="/api/download/xlsx" download>Download tracker (.xlsx)</a>
-        <a href="/api/download/csv" download>Download CSV</a>
-        <a href="/api/download/png" download>Download snapshot (.png)</a>
-      `;
-      resultsWrap.style.display = 'block';
-    } else {
-      statusEl.className = 'status show err';
-      statusEl.textContent = 'Unexpected response from server.';
+      statusEl.textContent = `✖ Server returned a non-JSON response (HTTP ${resp.status}).`;
+      appendDebug(statusEl, raw.slice(0, 2000) || '(empty body)');
+      btn.disabled = false;
+      return;
     }
+
+    if (data.status !== 'started') {
+      // Immediate validation failure (bad password, missing cookies, etc.)
+      statusEl.className = 'status show err';
+      statusEl.textContent = '✖ ' + (data.message || 'Unexpected response from server.');
+      btn.disabled = false;
+      return;
+    }
+
+    await pollStatus(statusEl, resultsWrap, btn);
   } catch (e) {
     statusEl.className = 'status show err';
     statusEl.textContent = 'Request failed: ' + e.message;
-  } finally {
     btn.disabled = false;
+  }
+}
+
+async function pollStatus(statusEl, resultsWrap, btn) {
+  let first = true;
+  while (true) {
+    if (!first) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    first = false;
+
+    let data;
+    try {
+      const resp = await fetch('/api/run/status');
+      const raw = await resp.text();
+      data = JSON.parse(raw);
+    } catch (e) {
+      // Transient network hiccup while polling — keep trying rather than giving up.
+      continue;
+    }
+
+    if (data.status === 'running') {
+      const p = data.progress || {};
+      const progressText = p.total ? ` (${p.done}/${p.total})` : '';
+      statusEl.className = 'status show pending';
+      statusEl.textContent = `Running — ${data.phase || 'working'}${progressText}…`;
+      continue;
+    }
+
+    // Terminal state reached.
+    renderResult(data, statusEl, resultsWrap);
+    btn.disabled = false;
+    return;
+  }
+}
+
+function renderResult(data, statusEl, resultsWrap) {
+  if (data.status === 'cookies_expired') {
+    statusEl.className = 'status show warn';
+    statusEl.textContent = '⚠️ ' + data.message;
+    if (data.debug) {
+      const d = data.debug;
+      appendDebug(statusEl,
+        `Cookie names sent: ${(d.cookie_names_sent || []).join(', ') || '(none)'}\n` +
+        `Landed on: ${d.landed_url}\n` +
+        `Page title: ${d.page_title}\n` +
+        `Body snippet: ${d.body_snippet}`);
+    }
+  } else if (data.status === 'error') {
+    statusEl.className = 'status show err';
+    statusEl.textContent = '✖ ' + (data.message || 'Something went wrong.');
+    if (data.traceback) {
+      appendDebug(statusEl, data.traceback);
+    }
+  } else if (data.status === 'done') {
+    document.getElementById('cookiesOptionalTag').style.display = 'inline';
+    statusEl.className = 'status show ok';
+    statusEl.textContent = `✔ Done for ${data.date} — ${data.scraped_ok}/${data.scraped} prices captured, ` +
+      `${data.tracker.updated} tracker rows updated` +
+      (data.tracker.skipped ? `, ${data.tracker.skipped} skipped` : '') + '.';
+
+    const tbody = document.querySelector('#resultsTable tbody');
+    tbody.innerHTML = '';
+    data.results.forEach(r => {
+      const tr = document.createElement('tr');
+      const item = r.url.split('/').pop();
+      const badgeClass = r.status === 'ok' ? 'ok' : (r.status === 'check' ? 'check' : 'error');
+      tr.innerHTML = `<td>${item}</td><td>${r.current_price || '—'}</td><td><span class="badge ${badgeClass}">${r.status}</span></td>`;
+      tbody.appendChild(tr);
+    });
+
+    const dl = document.getElementById('downloads');
+    dl.innerHTML = `
+      <a href="/api/download/xlsx" download>Download tracker (.xlsx)</a>
+      <a href="/api/download/csv" download>Download CSV</a>
+      <a href="/api/download/png" download>Download snapshot (.png)</a>
+    `;
+    resultsWrap.style.display = 'block';
+  } else {
+    statusEl.className = 'status show err';
+    statusEl.textContent = 'Unexpected response from server.';
+    appendDebug(statusEl, JSON.stringify(data, null, 2));
   }
 }
 </script>

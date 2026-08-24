@@ -11,11 +11,13 @@ Runs as a normal server process with its own outbound network access (no
 sandbox network restrictions), so Playwright talks to bigmint.co directly.
 """
 
+import asyncio
 import json
 import os
 import re
 import csv
 import shutil
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -51,6 +53,13 @@ app = FastAPI(title="BigMint Price Tracker")
 
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Scraping runs as a background task instead of inline in the request handler
+# because it can take longer than Render's proxy will hold an HTTP request
+# open, which was truncating the JSON response. The frontend polls
+# /api/run/status instead. Single in-memory job slot is fine — this app has
+# one user running one scrape at a time.
+JOB_STATE = {"status": "idle"}
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +372,20 @@ def config():
     return {"password_required": bool(APP_PASSWORD), "cookies_saved": COOKIES_FILE.exists()}
 
 
+@app.get("/api/run/status")
+def run_status():
+    return JOB_STATE
+
+
 @app.post("/api/run")
 async def run_scrape(request: Request):
     payload = await request.json()
 
     if APP_PASSWORD and payload.get("password") != APP_PASSWORD:
         return JSONResponse({"status": "error", "message": "Incorrect password."}, status_code=401)
+
+    if JOB_STATE.get("status") == "running":
+        return JSONResponse({"status": "error", "message": "A scrape is already running."}, status_code=409)
 
     cookies_text = (payload.get("cookies_text") or "").strip()
     used_saved_cookies = False
@@ -398,8 +415,28 @@ async def run_scrape(request: Request):
     if not URLS_FILE.exists():
         return JSONResponse({"status": "error", "message": "Server has no urls.csv configured — see README."}, status_code=500)
 
+    JOB_STATE.clear()
+    JOB_STATE.update({"status": "running", "phase": "starting browser", "progress": {"done": 0, "total": 0}})
+    asyncio.create_task(_run_scrape_job(cookies, used_saved_cookies))
+    return {"status": "started"}
+
+
+async def _run_scrape_job(cookies, used_saved_cookies):
+    try:
+        await _do_scrape(cookies, used_saved_cookies)
+    except Exception as e:
+        JOB_STATE.clear()
+        JOB_STATE.update({
+            "status": "error",
+            "message": f"Unexpected error: {e}",
+            "traceback": traceback.format_exc(),
+        })
+
+
+async def _do_scrape(cookies, used_saved_cookies):
     urls = read_urls()
     today = datetime.now(IST)
+    JOB_STATE["progress"] = {"done": 0, "total": len(urls)}
 
     results = {}
     async with async_playwright() as p:
@@ -421,13 +458,18 @@ async def run_scrape(request: Request):
         await context.add_cookies(cookies)
         page = await context.new_page()
 
+        JOB_STATE["phase"] = "loading bigmint.co"
         try:
             await page.goto(BIGMINT_HOME, wait_until="domcontentloaded", timeout=60000)
             await wait_past_shield_check(page)
         except Exception as e:
             await browser.close()
-            return JSONResponse({"status": "error", "message": f"Could not reach bigmint.co: {e}"}, status_code=502)
+            JOB_STATE.clear()
+            JOB_STATE.update({"status": "error", "message": f"Could not reach bigmint.co: {e}",
+                               "traceback": traceback.format_exc()})
+            return
 
+        JOB_STATE["phase"] = "checking login"
         if not await is_logged_in(page):
             try:
                 debug_url = page.url
@@ -454,7 +496,8 @@ async def run_scrape(request: Request):
                     "These cookies didn't log in — they've likely expired. Export fresh cookies from a "
                     "logged-in BigMint browser session and paste them in again."
                 )
-            return JSONResponse({
+            JOB_STATE.clear()
+            JOB_STATE.update({
                 "status": "cookies_expired",
                 "message": message,
                 "debug": {
@@ -463,14 +506,17 @@ async def run_scrape(request: Request):
                     "page_title": debug_title,
                     "body_snippet": debug_snippet,
                 },
-            }, status_code=200)
+            })
+            return
 
         save_cookies(cookies)
 
-        for url in urls:
+        for i, url in enumerate(urls):
+            JOB_STATE["phase"] = f"scraping {slug_from_url(url)}"
             row = {"url": url, "current_price": "", "status": "ok", "notes": ""}
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await wait_past_shield_check(page, max_wait_ms=10000)
                 await page.wait_for_timeout(1800)
                 body_text = await page.locator("body").inner_text()
                 m = re.search(r"₹\s*([0-9,]+(?:\.[0-9]+)?)", body_text)
@@ -481,17 +527,20 @@ async def run_scrape(request: Request):
                 row["status"] = "error"
                 row["notes"] = str(e)[:200]
             results[url] = row
+            JOB_STATE["progress"] = {"done": i + 1, "total": len(urls)}
 
         await browser.close()
 
+    JOB_STATE["phase"] = "updating tracker"
     tracker_summary = update_tracker(results, today)
     write_csv(results, today)
     snapshot_path = generate_snapshot(today)
 
     ok_count = sum(1 for r in results.values() if r["status"] == "ok")
 
-    return JSONResponse({
-        "status": "ok",
+    JOB_STATE.clear()
+    JOB_STATE.update({
+        "status": "done",
         "date": today.strftime("%Y-%m-%d"),
         "scraped": len(results),
         "scraped_ok": ok_count,
