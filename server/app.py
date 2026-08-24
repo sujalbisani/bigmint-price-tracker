@@ -2,13 +2,18 @@
 BigMint price tracker — web app backend.
 
 Paste fresh bigmint.co cookies into the frontend textbox, hit Run, and this
-scrapes the current price for every URL in data/urls.csv, updates
+fetches the current price for every URL in data/urls.csv, updates
 data/tracker.xlsx (the running two-year tracker), regenerates a snapshot
 image, and writes a CSV of the run. If the cookies are missing/expired, it
 reports that clearly instead of guessing.
 
-Runs as a normal server process with its own outbound network access (no
-sandbox network restrictions), so Playwright talks to bigmint.co directly.
+Prices come from bigmint.co's own JSON price-graph endpoint
+(/prices_tg/graph/{itemID}/{currency}/{priceType}) via plain HTTP requests
+with the session cookies — no headless browser involved. That endpoint is
+what the price detail page itself calls client-side to draw its chart, and
+its item ID/price type/currency are embedded in each tracked URL's slug.
+Skipping a full browser (previously Playwright + Chromium) avoids the RAM a
+headless browser needs, which was getting OOM-killed on Render's free tier.
 """
 
 import asyncio
@@ -21,14 +26,13 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 import openpyxl
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-from playwright.async_api import async_playwright
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -158,58 +162,55 @@ def slug_from_url(url):
     return url.rstrip("/").split("/")[-1] or "unknown"
 
 
-async def is_logged_in(page):
-    """The login modal's markup (password field etc.) is present in the DOM
-    even when you ARE logged in, so we can't just look for 'password'. The
-    reliable signal is the personalised greeting / nav that only render for
-    an authenticated session."""
-    try:
-        text = (await page.locator("body").inner_text(timeout=5000))[:800].lower()
-    except Exception:
-        text = ""
-    return ("hi, mr" in text or "hi, ms" in text or "my portfolio" in text) and "enter your phone number" not in text
+def text_looks_logged_in(text):
+    """The login modal's markup (password field etc.) is present in the raw
+    HTML even when you ARE logged in, so we can't just look for 'password'.
+    The reliable signal is the personalised greeting that's server-rendered
+    directly into the page for an authenticated session (e.g. "Hi, Mr ...")."""
+    t = text[:2000].lower()
+    return ("hi, mr" in t or "hi, ms" in t or "my portfolio" in t) and "enter your phone number" not in t
 
 
-TRACKER_HOSTS = (
-    "posthog.com", "i.posthog.com",
-    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
-    "facebook.net", "connect.facebook.net",
-    "clarity.ms", "adroll.com", "sendinblue.com", "sibautomation.com",
-    "hotjar.com",
-)
+def text_looks_shield_blocked(text):
+    """bigmint.co sits behind a Bunny Shield anti-bot check that can
+    interstitial a request with an "Establishing a secure connection..."
+    page instead of the real content."""
+    t = text[:500].lower()
+    return "establishing" in t and "secure connection" in t
 
 
-async def _block_heavy_requests(route):
-    """Drop images/media/fonts and known analytics/tracker requests so
-    Chromium's memory footprint stays low enough to survive Render's
-    free-tier RAM limit — we only need the page's text content, not its
-    images or third-party trackers."""
-    req = route.request
-    if req.resource_type in ("image", "media", "font"):
-        await route.abort()
-        return
-    if any(host in req.url for host in TRACKER_HOSTS):
-        await route.abort()
-        return
-    await route.continue_()
+ITEM_URL_RE = re.compile(r"-(\d+)-([a-zA-Z])-([A-Za-z]{3})/?$")
 
 
-async def wait_past_shield_check(page, max_wait_ms=20000, poll_ms=1000):
-    """bigmint.co sits behind a Bunny Shield JS challenge ("Establishing a
-    secure connection...") that briefly interstitials real navigations too.
-    Poll until the title moves past it instead of assuming one fixed delay
-    is enough."""
-    waited = 0
-    while waited < max_wait_ms:
-        try:
-            title = (await page.title()).lower()
-        except Exception:
-            title = ""
-        if "establishing" not in title and "secure connection" not in title:
-            break
-        await page.wait_for_timeout(poll_ms)
-        waited += poll_ms
-    await page.wait_for_timeout(1500)
+def parse_item_from_url(url):
+    """Tracked URLs look like
+    .../prices/detail/pig-iron-dap-raipur-india-1102-f-INR — the trailing
+    -{itemID}-{priceType}-{currency} maps directly onto bigmint.co's own
+    price-graph API path."""
+    m = ITEM_URL_RE.search(url.rstrip("/").split("?")[0])
+    if not m:
+        return None
+    item_id, price_type, currency = m.groups()
+    return {"item_id": item_id, "price_type": price_type, "currency": currency.upper()}
+
+
+def build_cookie_jar(cookies):
+    jar = httpx.Cookies()
+    for c in cookies:
+        jar.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+    return jar
+
+
+async def fetch_current_price(client, item_id, currency, price_type, market="ferrous"):
+    url = f"https://www.bigmint.co/prices_tg/graph/{item_id}/{currency}/{price_type}"
+    resp = await client.get(url, params={"market": market})
+    resp.raise_for_status()
+    data = resp.json()
+    points = data.get("point") or (data.get("data") or {}).get("point") or []
+    if not points:
+        return None
+    latest = max(points, key=lambda p: p[0])
+    return latest[1]
 
 
 def find_header_column(ws, header_row, predicate, max_col=60):
@@ -457,70 +458,44 @@ async def _run_scrape_job(cookies, used_saved_cookies):
         })
 
 
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
 async def _do_scrape(cookies, used_saved_cookies):
     urls = read_urls()
     today = datetime.now(IST)
     JOB_STATE["progress"] = {"done": 0, "total": len(urls)}
 
+    jar = build_cookie_jar(cookies)
     results = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                # Render's free tier has very little RAM; these cut Chromium's
-                # footprint to reduce the odds of an OOM kill mid-run.
-                # (Deliberately NOT --single-process — that flag is known to
-                # be unstable for headless Chrome on Linux and can itself
-                # cause the crashes it's meant to prevent.)
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-extensions",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
-        await context.route("**/*", _block_heavy_requests)
-        await context.add_cookies(cookies)
-        page = await context.new_page()
 
-        JOB_STATE["phase"] = "loading bigmint.co"
+    async with httpx.AsyncClient(
+        cookies=jar, headers=REQUEST_HEADERS, follow_redirects=True, timeout=30
+    ) as client:
+        JOB_STATE["phase"] = "checking login"
         try:
-            await page.goto(BIGMINT_HOME, wait_until="domcontentloaded", timeout=60000)
-            await wait_past_shield_check(page)
+            resp = await client.get(BIGMINT_HOME)
         except Exception as e:
-            await browser.close()
             JOB_STATE.clear()
             JOB_STATE.update({"status": "error", "message": f"Could not reach bigmint.co: {e}",
                                "traceback": traceback.format_exc()})
             return
 
-        JOB_STATE["phase"] = "checking login"
-        if not await is_logged_in(page):
-            try:
-                debug_url = page.url
-                debug_title = await page.title()
-                debug_snippet = (await page.locator("body").inner_text(timeout=3000))[:300]
-            except Exception:
-                debug_url, debug_title, debug_snippet = "", "", ""
-            await browser.close()
-
-            blocked_by_shield = "establishing" in debug_title.lower() or "secure connection" in debug_title.lower()
+        body = resp.text
+        if not text_looks_logged_in(body):
+            blocked_by_shield = text_looks_shield_blocked(body)
             if blocked_by_shield:
                 message = (
-                    "bigmint.co's bot-protection page didn't clear in time — this isn't your cookies, "
-                    "the automated browser got stuck on their security check. Try running again in a "
-                    "minute; if it keeps happening, tell me and I'll dig further."
+                    "bigmint.co's bot-protection page blocked this request — this isn't your cookies, "
+                    "the request got stuck on their security check. Try running again in a minute; if "
+                    "it keeps happening, tell me and I'll dig further."
                 )
             else:
                 if used_saved_cookies and COOKIES_FILE.exists():
@@ -538,9 +513,9 @@ async def _do_scrape(cookies, used_saved_cookies):
                 "message": message,
                 "debug": {
                     "cookie_names_sent": sorted(set(c["name"] for c in cookies)),
-                    "landed_url": debug_url,
-                    "page_title": debug_title,
-                    "body_snippet": debug_snippet,
+                    "landed_url": str(resp.url),
+                    "http_status": resp.status_code,
+                    "body_snippet": body[:300],
                 },
             })
             return
@@ -550,22 +525,22 @@ async def _do_scrape(cookies, used_saved_cookies):
         for i, url in enumerate(urls):
             JOB_STATE["phase"] = f"scraping {slug_from_url(url)}"
             row = {"url": url, "current_price": "", "status": "ok", "notes": ""}
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await wait_past_shield_check(page, max_wait_ms=10000)
-                await page.wait_for_timeout(1800)
-                body_text = await page.locator("body").inner_text()
-                m = re.search(r"₹\s*([0-9,]+(?:\.[0-9]+)?)", body_text)
-                row["current_price"] = clean_number(m.group(1)) if m else ""
-                if not row["current_price"]:
-                    row["status"] = "check"
-            except Exception as e:
+            parsed = parse_item_from_url(url)
+            if not parsed:
                 row["status"] = "error"
-                row["notes"] = str(e)[:200]
+                row["notes"] = "Could not parse item ID/price type/currency from this URL"
+            else:
+                try:
+                    price = await fetch_current_price(client, **parsed)
+                    if price is None:
+                        row["status"] = "check"
+                    else:
+                        row["current_price"] = clean_number(str(price))
+                except Exception as e:
+                    row["status"] = "error"
+                    row["notes"] = str(e)[:200]
             results[url] = row
             JOB_STATE["progress"] = {"done": i + 1, "total": len(urls)}
-
-        await browser.close()
 
     JOB_STATE["phase"] = "updating tracker"
     tracker_summary = update_tracker(results, today)
