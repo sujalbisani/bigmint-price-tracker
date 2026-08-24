@@ -442,7 +442,16 @@ async def _do_scrape(cookies, used_saved_cookies):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                # Render's free tier has very little RAM; these cut Chromium's
+                # footprint to reduce the odds of an OOM kill mid-run.
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-extensions",
+                "--single-process",
+            ],
         )
         context = await browser.new_context(
             viewport={"width": 1440, "height": 900},

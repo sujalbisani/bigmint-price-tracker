@@ -292,6 +292,12 @@ function renderResult(data, statusEl, resultsWrap) {
       <a href="/api/download/png" download>Download snapshot (.png)</a>
     `;
     resultsWrap.style.display = 'block';
+  } else if (data.status === 'idle') {
+    statusEl.className = 'status show err';
+    statusEl.textContent = '✖ The server lost track of this run — it most likely restarted mid-scrape ' +
+      '(Render\'s free tier has very little RAM and headless Chromium can trigger an out-of-memory ' +
+      'restart). Try Run again; if it keeps happening, check the Render service\'s Logs/Events tab for ' +
+      'a restart around this time and let me know.';
   } else {
     statusEl.className = 'status show err';
     statusEl.textContent = 'Unexpected response from server.';
