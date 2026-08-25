@@ -167,7 +167,7 @@ def text_looks_logged_in(text):
     HTML even when you ARE logged in, so we can't just look for 'password'.
     The reliable signal is the personalised greeting that's server-rendered
     directly into the page for an authenticated session (e.g. "Hi, Mr ...")."""
-    t = text[:2000].lower()
+    t = text.lower()
     return ("hi, mr" in t or "hi, ms" in t or "my portfolio" in t) and "enter your phone number" not in t
 
 
@@ -175,7 +175,7 @@ def text_looks_shield_blocked(text):
     """bigmint.co sits behind a Bunny Shield anti-bot check that can
     interstitial a request with an "Establishing a secure connection..."
     page instead of the real content."""
-    t = text[:500].lower()
+    t = text.lower()
     return "establishing" in t and "secure connection" in t
 
 
