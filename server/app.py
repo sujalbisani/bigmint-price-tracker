@@ -195,16 +195,26 @@ def parse_item_from_url(url):
 
 
 
-async def fetch_current_price(client, item_id, currency, price_type, market="ferrous"):
+async def fetch_prices(client, item_id, currency, price_type, market="ferrous"):
     url = f"https://www.bigmint.co/prices_tg/graph/{item_id}/{currency}/{price_type}"
     resp = await client.get(url, params={"market": market})
     resp.raise_for_status()
     data = resp.json()
     points = data.get("point") or (data.get("data") or {}).get("point") or []
     if not points:
-        return None
+        return None, None
     latest = max(points, key=lambda p: p[0])
-    return latest[1]
+    
+    today = datetime.now(IST)
+    month_points = []
+    for ts, price in points:
+        dt = datetime.fromtimestamp(ts / 1000.0, IST)
+        if dt.year == today.year and dt.month == today.month:
+            month_points.append(price)
+            
+    month_avg = sum(month_points) / len(month_points) if month_points else latest[1]
+    
+    return latest[1], month_avg
 
 
 def find_header_column(ws, header_row, predicate, max_col=60):
@@ -273,7 +283,8 @@ def update_tracker(results, today):
         try:
             val = float(row["current_price"])
             ws.cell(row=r, column=current_col).value = val
-            ws.cell(row=r, column=month_col).value = val
+            if row.get("month_price"):
+                ws.cell(row=r, column=month_col).value = float(row["month_price"])
             updated += 1
         except ValueError:
             skipped += 1
@@ -511,18 +522,19 @@ async def _do_scrape(cookies, used_saved_cookies):
 
         for i, url in enumerate(urls):
             JOB_STATE["phase"] = f"scraping {slug_from_url(url)}"
-            row = {"url": url, "current_price": "", "status": "ok", "notes": ""}
+            row = {"url": url, "current_price": "", "month_price": "", "status": "ok", "notes": ""}
             parsed = parse_item_from_url(url)
             if not parsed:
                 row["status"] = "error"
                 row["notes"] = "Could not parse item ID/price type/currency from this URL"
             else:
                 try:
-                    price = await fetch_current_price(client, **parsed)
-                    if price is None:
+                    current_price, month_price = await fetch_prices(client, **parsed)
+                    if current_price is None:
                         row["status"] = "check"
                     else:
-                        row["current_price"] = clean_number(str(price))
+                        row["current_price"] = clean_number(str(current_price))
+                        row["month_price"] = clean_number(str(round(month_price, 2)))
                 except Exception as e:
                     row["status"] = "error"
                     row["notes"] = str(e)[:200]
