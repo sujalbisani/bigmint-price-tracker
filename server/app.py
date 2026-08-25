@@ -330,9 +330,11 @@ def generate_snapshot(today):
         def fmt(val):
             if val is None:
                 return ""
-            if isinstance(val, float):
-                return f"{val:,.0f}" if val.is_integer() else f"{val:,.2f}"
-            return str(val)
+            try:
+                v = float(str(val).replace(",", ""))
+                return f"{v:,.0f}" if v.is_integer() else f"{v:,.2f}"
+            except (ValueError, TypeError):
+                return str(val)
 
         rows.append([fmt(ws.cell(row=r, column=c).value) for c in display_cols])
 
@@ -343,28 +345,17 @@ def generate_snapshot(today):
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.axis("off")
-    table = ax.table(cellText=rows, colLabels=headers, loc="center", cellLoc="center")
+    table = ax.table(cellText=rows, colLabels=headers, loc="center", cellLoc="right")
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.scale(1, 1.6)
     table.auto_set_column_width(list(range(n_cols)))
 
-    for row_idx in range(n_rows):
-        cell = table[row_idx, 0]
-        cell.set_text_props(ha="left")
-        cell.PAD = 0.02
-
     for col_idx in range(n_cols):
         cell = table[0, col_idx]
-        cell.set_facecolor("#2c3e50")
-        cell.set_text_props(weight="bold", color="white")
+        cell.set_facecolor("#92cddc")
+        cell.set_text_props(weight="bold", color="black", ha="center")
 
-    current_display_idx = display_cols.index(current_col)
-    for row_idx in range(1, n_rows):
-        table[row_idx, current_display_idx].set_facecolor("#eaf2f8")
-
-    ax.set_title(f"BigMint Price Tracker — Snapshot {today.strftime('%Y-%m-%d')}",
-                 fontsize=12, fontweight="bold", pad=20)
 
     out_path = SNAPSHOT_DIR / f"snapshot_{today.strftime('%Y-%m-%d')}.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
