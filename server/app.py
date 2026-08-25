@@ -26,7 +26,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-import httpx
+from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 import openpyxl
@@ -193,12 +193,6 @@ def parse_item_from_url(url):
     item_id, price_type, currency = m.groups()
     return {"item_id": item_id, "price_type": price_type, "currency": currency.upper()}
 
-
-def build_cookie_jar(cookies):
-    jar = httpx.Cookies()
-    for c in cookies:
-        jar.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
-    return jar
 
 
 async def fetch_current_price(client, item_id, currency, price_type, market="ferrous"):
@@ -473,12 +467,14 @@ async def _do_scrape(cookies, used_saved_cookies):
     today = datetime.now(IST)
     JOB_STATE["progress"] = {"done": 0, "total": len(urls)}
 
-    jar = build_cookie_jar(cookies)
     results = {}
 
-    async with httpx.AsyncClient(
-        cookies=jar, headers=REQUEST_HEADERS, follow_redirects=True, timeout=30
+    async with AsyncSession(
+        impersonate="chrome110", headers=REQUEST_HEADERS, timeout=30
     ) as client:
+        for c in cookies:
+            client.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+
         JOB_STATE["phase"] = "checking login"
         try:
             resp = await client.get(BIGMINT_HOME)
