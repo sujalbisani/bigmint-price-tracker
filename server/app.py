@@ -438,13 +438,14 @@ async def run_scrape(request: Request):
 
     JOB_STATE.clear()
     JOB_STATE.update({"status": "running", "phase": "starting browser", "progress": {"done": 0, "total": 0}})
-    asyncio.create_task(_run_scrape_job(cookies, used_saved_cookies))
+    user_agent = request.headers.get("user-agent") or REQUEST_HEADERS["User-Agent"]
+    asyncio.create_task(_run_scrape_job(cookies, used_saved_cookies, user_agent))
     return {"status": "started"}
 
 
-async def _run_scrape_job(cookies, used_saved_cookies):
+async def _run_scrape_job(cookies, used_saved_cookies, user_agent):
     try:
-        await _do_scrape(cookies, used_saved_cookies)
+        await _do_scrape(cookies, used_saved_cookies, user_agent)
     except Exception as e:
         JOB_STATE.clear()
         JOB_STATE.update({
@@ -464,7 +465,7 @@ REQUEST_HEADERS = {
 }
 
 
-async def _do_scrape(cookies, used_saved_cookies):
+async def _do_scrape(cookies, used_saved_cookies, user_agent):
     urls = read_urls()
     today = datetime.now(IST)
     JOB_STATE["progress"] = {"done": 0, "total": len(urls)}
@@ -472,7 +473,7 @@ async def _do_scrape(cookies, used_saved_cookies):
     results = {}
 
     async with AsyncSession(
-        impersonate="chrome110", headers=REQUEST_HEADERS, timeout=30
+        impersonate="chrome110", headers={**REQUEST_HEADERS, "User-Agent": user_agent}, timeout=30
     ) as client:
         for c in cookies:
             client.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
