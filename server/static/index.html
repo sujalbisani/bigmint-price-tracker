@@ -273,7 +273,8 @@ function renderResult(data, statusEl, resultsWrap) {
     statusEl.className = 'status show ok';
     statusEl.textContent = `✔ Done for ${data.date} — ${data.scraped_ok}/${data.scraped} prices captured, ` +
       `${data.tracker.updated} tracker rows updated` +
-      (data.tracker.skipped ? `, ${data.tracker.skipped} skipped` : '') + '.';
+      (data.tracker.skipped ? `, ${data.tracker.skipped} skipped` : '') +
+      (data.tracker.new_month_column ? ` — added new "${data.tracker.new_month_column}" tracker column` : '') + '.';
 
     const tbody = document.querySelector('#resultsTable tbody');
     tbody.innerHTML = '';

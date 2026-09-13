@@ -23,6 +23,7 @@ import re
 import csv
 import shutil
 import traceback
+from copy import copy
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 import openpyxl
+from openpyxl.utils import get_column_letter, column_index_from_string
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -213,19 +215,28 @@ async def fetch_prices(client, item_id, currency, price_type, market="ferrous", 
     data = resp.json()
     points = data.get("point") or (data.get("data") or {}).get("point") or []
     if not points:
-        return None, None
+        return None, None, None
     latest = max(points, key=lambda p: p[0])
-    
+
     today = datetime.now(IST)
+    prev_month = today.month - 1 or 12
+    prev_year = today.year if today.month > 1 else today.year - 1
+
     month_points = []
+    prev_month_points = []
     for ts, price in points:
         dt = datetime.fromtimestamp(ts / 1000.0, IST)
         if dt.year == today.year and dt.month == today.month:
             month_points.append(price)
-            
+        elif dt.year == prev_year and dt.month == prev_month:
+            prev_month_points.append(price)
+
     month_avg = sum(month_points) / len(month_points) if month_points else latest[1]
-    
-    return latest[1], month_avg
+    # Only meaningful the first run of a new month, to finalize the column
+    # that's about to be superseded — see update_tracker()'s new_month path.
+    prev_month_avg = sum(prev_month_points) / len(prev_month_points) if prev_month_points else None
+
+    return latest[1], month_avg, prev_month_avg
 
 
 def find_header_column(ws, header_row, predicate, max_col=60):
@@ -253,6 +264,41 @@ def find_month_column(ws, header_row, target_date, max_col=60):
     return find_header_column(ws, header_row, is_target_month, max_col=max_col)
 
 
+_MONTH_REF_RE = re.compile(
+    rf"{re.escape(EXCEL_SHEET)}!(\$?)([A-Z]+)(\$?\d+)(?::(\$?)([A-Z]+)(\$?\d+))?"
+)
+
+
+def _shift_monthly_col_refs(formula, insert_at):
+    def repl(m):
+        dollar1, col1, row1, dollar2, col2, row2 = m.groups()
+        idx1 = column_index_from_string(col1)
+        new_col1 = get_column_letter(idx1 + 1) if idx1 >= insert_at else col1
+        out = f"{EXCEL_SHEET}!{dollar1 or ''}{new_col1}{row1}"
+        if col2:
+            idx2 = column_index_from_string(col2)
+            new_col2 = get_column_letter(idx2 + 1) if idx2 >= insert_at else col2
+            out += f":{dollar2 or ''}{new_col2}{row2}"
+        return out
+
+    return _MONTH_REF_RE.sub(repl, formula)
+
+
+def _shift_monthly_formula_refs(wb, insert_at):
+    """Inserting a column into the Monthly sheet shifts its own cells fine,
+    but formulas on OTHER sheets (Quarterly, Delta-Monthly) reference
+    Monthly!<col><row> by letter and openpyxl won't rewrite those — Excel's
+    own Insert Column does, so replicate it here by hand."""
+    for name in wb.sheetnames:
+        if name == EXCEL_SHEET:
+            continue
+        sheet = wb[name]
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("=") and f"{EXCEL_SHEET}!" in cell.value:
+                    cell.value = _shift_monthly_col_refs(cell.value, insert_at)
+
+
 def update_tracker(results, today):
     if not TRACKER_FILE.exists():
         return {"updated": 0, "skipped": len(results), "not_found": list(results.keys()),
@@ -268,9 +314,40 @@ def update_tracker(results, today):
     current_col = find_header_column(ws, 1, lambda s: s.strip().lower().startswith(EXCEL_CURRENT_HEADER))
     month_col = find_month_column(ws, 1, today)
 
+    if not url_col or not current_col:
+        return {"updated": 0, "skipped": len(results), "not_found": [],
+                "error": f"Could not locate required columns (url_col={url_col}, current_col={current_col})."}
+
+    prev_month_col = None
+    new_month_label = None
+    if not month_col:
+        # First run of a new month: insert this month's column right before
+        # "Current" (matching how every prior month column was added), and
+        # finalize the column immediately to its left — the month that just
+        # closed — with its complete average instead of leaving it at
+        # whatever partial average the last run before month-end produced.
+        prev_month_col = current_col - 1
+        insert_at = current_col
+        ws.insert_cols(idx=insert_at, amount=1)
+        _shift_monthly_formula_refs(wb, insert_at)
+
+        new_month_label = today.strftime("%b'%y")
+        new_header = ws.cell(row=1, column=insert_at)
+        new_header.value = new_month_label
+        src_header = ws.cell(row=1, column=prev_month_col)
+        new_header.font = copy(src_header.font)
+        new_header.fill = copy(src_header.fill)
+        new_header.border = copy(src_header.border)
+        new_header.alignment = copy(src_header.alignment)
+        new_header.number_format = src_header.number_format
+
+        url_col = find_header_column(ws, 1, lambda s: s.strip().lower() == EXCEL_URL_HEADER)
+        current_col = find_header_column(ws, 1, lambda s: s.strip().lower().startswith(EXCEL_CURRENT_HEADER))
+        month_col = find_month_column(ws, 1, today)
+
     if not url_col or not current_col or not month_col:
         return {"updated": 0, "skipped": len(results), "not_found": [],
-                "error": f"Could not locate required columns (url_col={url_col}, current_col={current_col}, month_col={month_col})."}
+                "error": f"Could not locate required columns after setup (url_col={url_col}, current_col={current_col}, month_col={month_col})."}
 
     url_to_row = {}
     for r in range(2, ws.max_row + 1):
@@ -296,12 +373,17 @@ def update_tracker(results, today):
             ws.cell(row=r, column=current_col).value = val
             if row.get("month_price"):
                 ws.cell(row=r, column=month_col).value = float(row["month_price"])
+            if prev_month_col and row.get("prev_month_price"):
+                ws.cell(row=r, column=prev_month_col).value = float(row["prev_month_price"])
             updated += 1
         except ValueError:
             skipped += 1
 
     wb.save(TRACKER_FILE)
-    return {"updated": updated, "skipped": skipped, "not_found": not_found, "error": None}
+    result = {"updated": updated, "skipped": skipped, "not_found": not_found, "error": None}
+    if new_month_label:
+        result["new_month_column"] = new_month_label
+    return result
 
 
 def write_csv(results, today):
@@ -534,19 +616,21 @@ async def _do_scrape(cookies, used_saved_cookies, user_agent):
 
         for i, url in enumerate(urls):
             JOB_STATE["phase"] = f"scraping {slug_from_url(url)}"
-            row = {"url": url, "current_price": "", "month_price": "", "status": "ok", "notes": ""}
+            row = {"url": url, "current_price": "", "month_price": "", "prev_month_price": "", "status": "ok", "notes": ""}
             parsed = parse_item_from_url(url)
             if not parsed:
                 row["status"] = "error"
                 row["notes"] = "Could not parse item ID/price type/currency from this URL"
             else:
                 try:
-                    current_price, month_price = await fetch_prices(client, **parsed)
+                    current_price, month_price, prev_month_price = await fetch_prices(client, **parsed)
                     if current_price is None:
                         row["status"] = "check"
                     else:
                         row["current_price"] = clean_number(str(current_price))
                         row["month_price"] = clean_number(str(round(month_price, 2)))
+                        if prev_month_price is not None:
+                            row["prev_month_price"] = clean_number(str(round(prev_month_price, 2)))
                 except Exception as e:
                     row["status"] = "error"
                     row["notes"] = str(e)[:200]
