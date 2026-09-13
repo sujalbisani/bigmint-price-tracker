@@ -195,10 +195,21 @@ def parse_item_from_url(url):
 
 
 
-async def fetch_prices(client, item_id, currency, price_type, market="ferrous"):
+async def fetch_prices(client, item_id, currency, price_type, market="ferrous", max_retries=2):
+    """A burst of back-to-back requests can trip Bunny Shield's JS-only
+    "Establishing a secure connection..." challenge mid-run — a plain HTTP
+    client can't solve it, but the block is usually short-lived, so back off
+    and retry a couple of times before giving up on this item."""
     url = f"https://www.bigmint.co/prices_tg/graph/{item_id}/{currency}/{price_type}"
-    resp = await client.get(url, params={"market": market})
-    resp.raise_for_status()
+    for attempt in range(max_retries + 1):
+        resp = await client.get(url, params={"market": market})
+        if resp.status_code == 403 and text_looks_shield_blocked(resp.text):
+            if attempt < max_retries:
+                await asyncio.sleep(8 * (attempt + 1))
+                continue
+            raise RuntimeError("Blocked by bigmint.co's bot-protection (Bunny Shield) after retries")
+        resp.raise_for_status()
+        break
     data = resp.json()
     points = data.get("point") or (data.get("data") or {}).get("point") or []
     if not points:
@@ -541,6 +552,8 @@ async def _do_scrape(cookies, used_saved_cookies, user_agent):
                     row["notes"] = str(e)[:200]
             results[url] = row
             JOB_STATE["progress"] = {"done": i + 1, "total": len(urls)}
+            if i < len(urls) - 1:
+                await asyncio.sleep(1.5)
 
     JOB_STATE["phase"] = "updating tracker"
     tracker_summary = update_tracker(results, today)
