@@ -197,21 +197,20 @@ def parse_item_from_url(url):
 
 
 
-async def fetch_prices(client, item_id, currency, price_type, market="ferrous", max_retries=2):
-    """A burst of back-to-back requests can trip Bunny Shield's JS-only
-    "Establishing a secure connection..." challenge mid-run — a plain HTTP
-    client can't solve it, but the block is usually short-lived, so back off
-    and retry a couple of times before giving up on this item."""
+class BunnyShieldBlocked(Exception):
+    """A single request came back as Bunny Shield's JS-only challenge page.
+    The block is session/IP-wide, not specific to this one item — a plain
+    HTTP client can never solve the JS challenge itself, so retrying THIS
+    item alone is pointless; the caller decides once per run whether to
+    cool down and try again, rather than re-trying every affected item."""
+
+
+async def fetch_prices(client, item_id, currency, price_type, market="ferrous"):
     url = f"https://www.bigmint.co/prices_tg/graph/{item_id}/{currency}/{price_type}"
-    for attempt in range(max_retries + 1):
-        resp = await client.get(url, params={"market": market})
-        if resp.status_code == 403 and text_looks_shield_blocked(resp.text):
-            if attempt < max_retries:
-                await asyncio.sleep(8 * (attempt + 1))
-                continue
-            raise RuntimeError("Blocked by bigmint.co's bot-protection (Bunny Shield) after retries")
-        resp.raise_for_status()
-        break
+    resp = await client.get(url, params={"market": market})
+    if resp.status_code == 403 and text_looks_shield_blocked(resp.text):
+        raise BunnyShieldBlocked()
+    resp.raise_for_status()
     data = resp.json()
     points = data.get("point") or (data.get("data") or {}).get("point") or []
     if not points:
@@ -237,6 +236,22 @@ async def fetch_prices(client, item_id, currency, price_type, market="ferrous", 
     prev_month_avg = sum(prev_month_points) / len(prev_month_points) if prev_month_points else None
 
     return latest[1], month_avg, prev_month_avg
+
+
+async def _fetch_with_shield_retry(client, parsed, shield_state):
+    """Bunny Shield's block is session-wide, not specific to one item, so
+    it's only worth cooling down and retrying once per run — not once per
+    item, which would just waste minutes re-hitting a block that hasn't
+    lifted yet. shield_state is shared across the whole scrape loop."""
+    try:
+        return await fetch_prices(client, **parsed)
+    except BunnyShieldBlocked:
+        if shield_state["cooldown_used"]:
+            raise
+        shield_state["cooldown_used"] = True
+        JOB_STATE["phase"] = "bigmint.co's bot-protection tripped — cooling down before retrying"
+        await asyncio.sleep(30)
+        return await fetch_prices(client, **parsed)  # a second block propagates as-is
 
 
 def find_header_column(ws, header_row, predicate, max_col=60):
@@ -614,6 +629,7 @@ async def _do_scrape(cookies, used_saved_cookies, user_agent):
 
         save_cookies(cookies)
 
+        shield_state = {"cooldown_used": False}
         for i, url in enumerate(urls):
             JOB_STATE["phase"] = f"scraping {slug_from_url(url)}"
             row = {"url": url, "current_price": "", "month_price": "", "prev_month_price": "", "status": "ok", "notes": ""}
@@ -623,7 +639,27 @@ async def _do_scrape(cookies, used_saved_cookies, user_agent):
                 row["notes"] = "Could not parse item ID/price type/currency from this URL"
             else:
                 try:
-                    current_price, month_price, prev_month_price = await fetch_prices(client, **parsed)
+                    current_price, month_price, prev_month_price = await _fetch_with_shield_retry(client, parsed, shield_state)
+                except BunnyShieldBlocked:
+                    # Cooled down once already (see _fetch_with_shield_retry)
+                    # and still blocked — the block is session-wide, so
+                    # further items would just hit the same wall. Stop
+                    # calling bigmint.co for the rest of this run.
+                    row["status"] = "error"
+                    row["notes"] = "Blocked by bigmint.co's bot-protection (Bunny Shield); rest of this run skipped — try again shortly"
+                    results[url] = row
+                    for remaining_url in urls[i + 1:]:
+                        results[remaining_url] = {
+                            "url": remaining_url, "current_price": "", "month_price": "", "prev_month_price": "",
+                            "status": "error",
+                            "notes": "Skipped — bigmint.co's bot-protection blocked this run; try again shortly",
+                        }
+                    JOB_STATE["progress"] = {"done": len(urls), "total": len(urls)}
+                    break
+                except Exception as e:
+                    row["status"] = "error"
+                    row["notes"] = str(e)[:200]
+                else:
                     if current_price is None:
                         row["status"] = "check"
                     else:
@@ -631,13 +667,10 @@ async def _do_scrape(cookies, used_saved_cookies, user_agent):
                         row["month_price"] = clean_number(str(round(month_price, 2)))
                         if prev_month_price is not None:
                             row["prev_month_price"] = clean_number(str(round(prev_month_price, 2)))
-                except Exception as e:
-                    row["status"] = "error"
-                    row["notes"] = str(e)[:200]
             results[url] = row
             JOB_STATE["progress"] = {"done": i + 1, "total": len(urls)}
             if i < len(urls) - 1:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2)
 
     JOB_STATE["phase"] = "updating tracker"
     tracker_summary = update_tracker(results, today)
