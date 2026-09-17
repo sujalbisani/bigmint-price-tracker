@@ -16,7 +16,7 @@ Skipping a full browser (previously Playwright + Chromium) avoids the RAM a
 headless browser needs, which was getting OOM-killed on Render's free tier.
 """
 
-import asynciooooooo
+
 import json
 import os
 import re
